@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -28,6 +31,8 @@ type API struct {
 	scanner   *scanner.Service
 	providers *providers.Manager
 	jobSem    chan struct{}
+	sseMu     sync.Mutex
+	sse       map[string]map[chan []byte]struct{}
 }
 
 func New(cfg *config.Config, s store.Store) *API {
@@ -37,20 +42,49 @@ func New(cfg *config.Config, s store.Store) *API {
 		scanner:   scanner.NewService(cfg.Git),
 		providers: providers.NewManager(cfg, s),
 		jobSem:    make(chan struct{}, cfg.Analysis.MaxConcurrentJobs),
+		sse:       make(map[string]map[chan []byte]struct{}),
 	}
+}
+
+// publishJobEvent отправляет событие всем SSE-подписчикам задачи (неблокирующе).
+func (a *API) publishJobEvent(jobID string, payload any) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	a.sseMu.Lock()
+	defer a.sseMu.Unlock()
+	for ch := range a.sse[jobID] {
+		select {
+		case ch <- data:
+		default:
+		}
+	}
+}
+
+// jobEventHandler оборачивает store-вызовы прогресса публикацией SSE-событий.
+func (a *API) updateProgress(id string, p *store.Progress) {
+	a.store.UpdateProgress(id, p)
+	a.publishJobEvent(id, gin.H{
+		"type":     "progress",
+		"job_id":   id,
+		"status":   string(store.StatusRunning),
+		"progress": p,
+	})
 }
 
 func (a *API) Analyze(c *gin.Context) {
 	var req struct {
-		SourceType string `json:"source_type" binding:"required"`
-		Source     string `json:"source" binding:"required"`
-		Provider   string `json:"provider"`
-		Model      string `json:"model"`
-		Limit      int    `json:"limit"`
-		Language   string `json:"language"`
-		Cascade    *bool  `json:"cascade"`
-		Diff       *bool  `json:"diff"`
-		ReportType string `json:"report_type"`
+		SourceType  string `json:"source_type" binding:"required"`
+		Source      string `json:"source" binding:"required"`
+		Provider    string `json:"provider"`
+		Model       string `json:"model"`
+		Limit       int    `json:"limit"`
+		Language    string `json:"language"`
+		Cascade     *bool  `json:"cascade"`
+		Diff        *bool  `json:"diff"`
+		ReportType  string `json:"report_type"`
+		Incremental *bool  `json:"incremental"`
 
 		Since      string `json:"since"`
 		Until      string `json:"until"`
@@ -132,20 +166,26 @@ func (a *API) Analyze(c *gin.Context) {
 		diff = *req.Diff
 	}
 
+	incremental := a.cfg.Analysis.IncrementalEnabled
+	if req.Incremental != nil {
+		incremental = *req.Incremental
+	}
+
 	jobReq := store.Request{
-		SourceType: sourceType,
-		Source:     redactSource(sourceType, source),
-		Provider:   llm.NormalizeProvider(provider),
-		Model:      model,
-		Limit:      limit,
-		Language:   language,
-		Cascade:    cascade,
-		Diff:       diff,
-		ReportType: reportType,
-		Since:      filter.Since,
-		Until:      filter.Until,
-		FromCommit: filter.FromCommit,
-		ToCommit:   filter.ToCommit,
+		SourceType:  sourceType,
+		Source:      redactSource(sourceType, source),
+		Provider:    llm.NormalizeProvider(provider),
+		Model:       model,
+		Limit:       limit,
+		Language:    language,
+		Cascade:     cascade,
+		Diff:        diff,
+		ReportType:  reportType,
+		Incremental: incremental,
+		Since:       filter.Since,
+		Until:       filter.Until,
+		FromCommit:  filter.FromCommit,
+		ToCommit:    filter.ToCommit,
 	}
 
 	job, err := a.store.CreateJob(jobReq)
@@ -177,6 +217,90 @@ func (a *API) Job(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, job)
+}
+
+// JobEvents — SSE-поток прогресса задачи.
+func (a *API) JobEvents(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "job id is required"})
+		return
+	}
+
+	job, ok := a.store.GetJob(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})
+		return
+	}
+
+	ch := make(chan []byte, 32)
+	a.sseMu.Lock()
+	if a.sse[id] == nil {
+		a.sse[id] = make(map[chan []byte]struct{})
+	}
+	a.sse[id][ch] = struct{}{}
+	a.sseMu.Unlock()
+
+	defer func() {
+		a.sseMu.Lock()
+		delete(a.sse[id], ch)
+		if len(a.sse[id]) == 0 {
+			delete(a.sse, id)
+		}
+		a.sseMu.Unlock()
+		close(ch)
+	}()
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "streaming not supported"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	// Текущее состояние — первым событием, чтобы клиент сразу отрисовал прогресс.
+	if snapshot, err := json.Marshal(gin.H{
+		"type":     "snapshot",
+		"job_id":   id,
+		"status":   string(job.Status),
+		"progress": job.Progress,
+	}); err == nil {
+		c.Writer.WriteString("data: " + string(snapshot) + "\n\n")
+		flusher.Flush()
+	}
+
+	if job.Status != store.StatusRunning && job.Status != store.StatusQueued {
+		return
+	}
+
+	clientGone := c.Request.Context().Done()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case data, ok := <-ch:
+			if !ok {
+				return
+			}
+			if _, err := c.Writer.WriteString("data: " + string(data) + "\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			if _, err := c.Writer.WriteString(": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-clientGone:
+			return
+		}
+	}
 }
 
 func (a *API) Report(c *gin.Context) {
@@ -286,22 +410,63 @@ func respondProviderError(c *gin.Context, err error) {
 	}
 }
 
+// buildChainable собирает цепочку: retry(primary) + fallback-провайдеры с retry.
+func (a *API) buildChainable(primaryName string) (llm.Provider, error) {
+	primary, err := a.providers.Build(primaryName)
+	if err != nil {
+		return nil, err
+	}
+
+	wrapped := llm.WithRetries(primary, a.cfg.Analysis.MaxRetries, 2*time.Second)
+
+	var fallbacks []llm.Provider
+	for _, name := range a.cfg.Analysis.FallbackProviders {
+		name = llm.NormalizeProvider(name)
+		if name == "" || name == llm.NormalizeProvider(primaryName) {
+			continue
+		}
+		if !a.providers.Knows(name) {
+			log.Printf("[Job] fallback provider %q is not configured, skipping", name)
+			continue
+		}
+		fp, err := a.providers.Build(name)
+		if err != nil {
+			log.Printf("[Job] fallback provider %q failed to build, skipping: %v", name, err)
+			continue
+		}
+		fallbacks = append(fallbacks, llm.WithRetries(fp, a.cfg.Analysis.MaxRetries, 2*time.Second))
+	}
+
+	return llm.WithFallback(wrapped, fallbacks...), nil
+}
+
 func (a *API) runJob(id string, req store.Request, rawSource string) {
 	a.jobSem <- struct{}{}
 	defer func() { <-a.jobSem }()
+
+	// Паника в анализе не должна ронять процесс.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Job:%s] panic recovered: %v", id, r)
+			a.store.MarkFailed(id, "internal error: analysis panicked")
+		}
+	}()
 
 	if !a.store.MarkRunning(id) {
 		return
 	}
 
+	a.publishJobEvent(id, gin.H{"type": "status", "job_id": id, "status": string(store.StatusRunning)})
+
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Analysis.JobTimeout)
 	defer cancel()
 
-	provider, err := a.providers.Build(req.Provider)
+	provider, err := a.buildChainable(req.Provider)
 	if err != nil {
 		a.failJob(id, "provider configuration failed", err)
 		return
 	}
+	counter := llm.WithCounting(provider)
 
 	repo, err := a.scanner.Prepare(ctx, req.SourceType, rawSource)
 	if err != nil {
@@ -326,12 +491,12 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 		return
 	}
 
-	a.store.UpdateProgress(id, &store.Progress{
+	a.updateProgress(id, &store.Progress{
 		Stage:   "preparing",
 		Message: "Извлечение diff коммитов",
 	})
 
-	a.store.UpdateProgress(id, &store.Progress{
+	a.updateProgress(id, &store.Progress{
 		Stage:   "extracting_commits",
 		Message: "Анализ истории Git",
 		Details: fmt.Sprintf("Найдено коммитов: %d", len(commits)),
@@ -339,7 +504,7 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 
 	var commitsWithDiff []scanner.CommitWithDiff
 	if req.Diff {
-		a.store.UpdateProgress(id, &store.Progress{
+		a.updateProgress(id, &store.Progress{
 			Stage:        "extracting_diffs",
 			Message:      "Извлечение изменений кода (diff)",
 			TotalCommits: len(commits),
@@ -349,7 +514,7 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 			if len(shortHash) > 8 {
 				shortHash = shortHash[:8]
 			}
-			a.store.UpdateProgress(id, &store.Progress{
+			a.updateProgress(id, &store.Progress{
 				Stage:          "extracting_diffs",
 				Message:        "Извлечение изменений кода (diff)",
 				Details:        fmt.Sprintf("Обработка коммита %s", shortHash),
@@ -380,6 +545,9 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 		Until:        req.Until,
 		FromCommit:   req.FromCommit,
 		ToCommit:     req.ToCommit,
+		SourceKey:    sourceKeyFor(req),
+		Incremental:  req.Incremental,
+		Cache:        &storeDecisionCache{st: a.store},
 	}
 
 	var markdown string
@@ -392,8 +560,8 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 			BatchSize:   a.cfg.Analysis.BatchSize,
 		}
 
-		markdown, err = analyzer.RunCascade(ctx, provider, params, commitsWithDiff, cascadeCfg, func(stage, message, details string, totalBatches, doneBatches, totalReduce, doneReduce int) {
-			a.store.UpdateProgress(id, &store.Progress{
+		markdown, err = analyzer.RunCascade(ctx, counter, params, commitsWithDiff, cascadeCfg, func(stage, message, details string, totalBatches, doneBatches, totalReduce, doneReduce int) {
+			a.updateProgress(id, &store.Progress{
 				Stage:        stage,
 				TotalBatches: totalBatches,
 				DoneBatches:  doneBatches,
@@ -403,8 +571,11 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 			})
 		})
 	} else {
-		markdown, err = analyzer.Run(ctx, provider, params, commitsWithDiff, a.cfg.Analysis.BatchSize)
+		markdown, err = analyzer.Run(ctx, counter, params, commitsWithDiff, a.cfg.Analysis.BatchSize)
 	}
+
+	usage := counter.Snapshot()
+	a.store.UpdateUsage(id, usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
 
 	if err != nil {
 		a.failJob(id, "analysis failed", err)
@@ -418,7 +589,39 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 	}
 
 	a.store.MarkCompleted(id, report.ID)
-	log.Printf("[Job:%s] completed report_id=%s", id, report.ID)
+	a.publishJobEvent(id, gin.H{
+		"type":      "status",
+		"job_id":    id,
+		"status":    string(store.StatusCompleted),
+		"report_id": report.ID,
+	})
+	log.Printf("[Job:%s] completed report_id=%s tokens=%d requests=%d", id, report.ID, usage.TotalTokens, counter.Requests())
+}
+
+// sourceKeyFor — ключ инкрементального кэша: источник + тип отчёта + фильтры.
+func sourceKeyFor(req store.Request) string {
+	return strings.Join([]string{
+		req.SourceType,
+		req.Source,
+		req.ReportType,
+		req.Since,
+		req.Until,
+		req.FromCommit,
+		req.ToCommit,
+	}, "|")
+}
+
+// storeDecisionCache адаптирует store к analyzer.DecisionCache.
+type storeDecisionCache struct {
+	st store.Store
+}
+
+func (c *storeDecisionCache) Load(sourceKey string, hashes []string) (map[string][]byte, error) {
+	return c.st.LoadCommitDecisions(sourceKey, hashes)
+}
+
+func (c *storeDecisionCache) Save(sourceKey string, hashes []string, decisionsJSON []byte) error {
+	return c.st.SaveCommitDecisions(sourceKey, hashes, decisionsJSON)
 }
 
 func (a *API) Jobs(c *gin.Context) {
@@ -436,6 +639,7 @@ func (a *API) Jobs(c *gin.Context) {
 func (a *API) failJob(id, publicStage string, err error) {
 	log.Printf("[Job:%s] %s: %s", id, publicStage, sanitizeError(err))
 	a.store.MarkFailed(id, publicStage)
+	a.publishJobEvent(id, gin.H{"type": "status", "job_id": id, "status": string(store.StatusFailed), "error": publicStage})
 }
 
 func redactSource(sourceType, source string) string {

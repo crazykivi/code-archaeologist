@@ -48,6 +48,7 @@ func New(cfg *config.Config, api *handlers.API) *gin.Engine {
 	v1.POST("/analyze", middleware.RateLimit(analyzeLimiter), api.Analyze)
 	v1.GET("/jobs", middleware.RateLimit(readLimiter), api.Jobs)
 	v1.GET("/jobs/:id", middleware.RateLimit(readLimiter), api.Job)
+	v1.GET("/jobs/:id/events", middleware.RateLimit(readLimiter), api.JobEvents)
 	v1.DELETE("/jobs/:id", middleware.RateLimit(readLimiter), api.DeleteJob)
 	v1.GET("/reports/:id", middleware.RateLimit(readLimiter), api.Report)
 	v1.GET("/providers", middleware.RateLimit(readLimiter), api.Providers)

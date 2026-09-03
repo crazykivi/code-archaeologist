@@ -26,15 +26,16 @@ type Progress struct {
 }
 
 type Request struct {
-	SourceType string `json:"source_type"`
-	Source     string `json:"source"`
-	Provider   string `json:"provider"`
-	Model      string `json:"model,omitempty"`
-	Limit      int    `json:"limit"`
-	Language   string `json:"language"`
-	Cascade    bool   `json:"cascade"`
-	Diff       bool   `json:"diff"`
-	ReportType string `json:"report_type,omitempty"`
+	SourceType  string `json:"source_type"`
+	Source      string `json:"source"`
+	Provider    string `json:"provider"`
+	Model       string `json:"model,omitempty"`
+	Limit       int    `json:"limit"`
+	Language    string `json:"language"`
+	Cascade     bool   `json:"cascade"`
+	Diff        bool   `json:"diff"`
+	ReportType  string `json:"report_type,omitempty"`
+	Incremental bool   `json:"incremental"`
 
 	Since      string `json:"since,omitempty"`
 	Until      string `json:"until,omitempty"`
@@ -52,6 +53,10 @@ type Job struct {
 	ReportID   string    `json:"report_id,omitempty"`
 	Error      string    `json:"error,omitempty"`
 	Progress   *Progress `json:"progress,omitempty"`
+
+	PromptTokens     int64 `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64 `json:"completion_tokens,omitempty"`
+	TotalTokens      int64 `json:"total_tokens,omitempty"`
 }
 
 type Report struct {
@@ -91,6 +96,13 @@ type Store interface {
 	GetProviderConfig(name string) (*ProviderConfig, bool)
 	SaveProviderConfig(pc ProviderConfig) error
 	DeleteProviderConfig(name string) error
+
+	// Token usage
+	UpdateUsage(id string, prompt, completion, total int64) bool
+
+	// Decision cache (incremental analysis)
+	SaveCommitDecisions(sourceKey string, hashes []string, decisionsJSON []byte) error
+	LoadCommitDecisions(sourceKey string, hashes []string) (map[string][]byte, error)
 
 	// Lifecycle
 	Close() error

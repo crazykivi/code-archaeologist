@@ -15,6 +15,7 @@ type MemoryStore struct {
 	jobs      map[string]*Job
 	reports   map[string]*Report
 	providers map[string]ProviderConfig
+	decisions map[string]map[string][]byte
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -22,6 +23,7 @@ func NewMemoryStore() *MemoryStore {
 		jobs:      make(map[string]*Job),
 		reports:   make(map[string]*Report),
 		providers: make(map[string]ProviderConfig),
+		decisions: make(map[string]map[string][]byte),
 	}
 }
 
@@ -225,4 +227,60 @@ func (s *MemoryStore) DeleteProviderConfig(name string) error {
 	defer s.mu.Unlock()
 	delete(s.providers, strings.TrimSpace(name))
 	return nil
+}
+
+func (s *MemoryStore) UpdateUsage(id string, prompt, completion, total int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	j, ok := s.jobs[id]
+	if !ok {
+		return false
+	}
+	j.PromptTokens = prompt
+	j.CompletionTokens = completion
+	j.TotalTokens = total
+	return true
+}
+
+func (s *MemoryStore) SaveCommitDecisions(sourceKey string, hashes []string, decisionsJSON []byte) error {
+	if strings.TrimSpace(sourceKey) == "" || len(hashes) == 0 || len(decisionsJSON) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bySource, ok := s.decisions[sourceKey]
+	if !ok {
+		bySource = make(map[string][]byte)
+		s.decisions[sourceKey] = bySource
+	}
+	for _, h := range hashes {
+		if h != "" {
+			cp := make([]byte, len(decisionsJSON))
+			copy(cp, decisionsJSON)
+			bySource[h] = cp
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) LoadCommitDecisions(sourceKey string, hashes []string) (map[string][]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string][]byte, len(hashes))
+	bySource, ok := s.decisions[sourceKey]
+	if !ok {
+		return out, nil
+	}
+	for _, h := range hashes {
+		if data, ok := bySource[h]; ok {
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			out[h] = cp
+		}
+	}
+	return out, nil
 }

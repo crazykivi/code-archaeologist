@@ -30,11 +30,14 @@ type GitConfig struct {
 }
 
 type AnalysisConfig struct {
-	BatchSize         int
-	MaxConcurrentJobs int
-	RequestTimeout    time.Duration
-	JobTimeout        time.Duration
-	Temperature       float64
+	BatchSize          int
+	MaxConcurrentJobs  int
+	RequestTimeout     time.Duration
+	JobTimeout         time.Duration
+	Temperature        float64
+	MaxRetries         int
+	FallbackProviders  []string
+	IncrementalEnabled bool
 }
 
 type CascadeConfig struct {
@@ -165,11 +168,14 @@ func Load() (*Config, error) {
 		},
 
 		Analysis: AnalysisConfig{
-			BatchSize:         getEnvInt("ANALYSIS_BATCH_SIZE", 20),
-			MaxConcurrentJobs: getEnvInt("MAX_CONCURRENT_JOBS", 1),
-			RequestTimeout:    time.Duration(getEnvInt("LLM_REQUEST_TIMEOUT_SECONDS", 1800)) * time.Second,
-			JobTimeout:        time.Duration(getEnvInt("JOB_TIMEOUT_SECONDS", 7200)) * time.Second,
-			Temperature:       temperature,
+			BatchSize:          getEnvInt("ANALYSIS_BATCH_SIZE", 20),
+			MaxConcurrentJobs:  getEnvInt("MAX_CONCURRENT_JOBS", 1),
+			RequestTimeout:     time.Duration(getEnvInt("LLM_REQUEST_TIMEOUT_SECONDS", 1800)) * time.Second,
+			JobTimeout:         time.Duration(getEnvInt("JOB_TIMEOUT_SECONDS", 7200)) * time.Second,
+			Temperature:        temperature,
+			MaxRetries:         getEnvInt("LLM_MAX_RETRIES", 2),
+			FallbackProviders:  getEnvList("FALLBACK_PROVIDERS", nil),
+			IncrementalEnabled: getEnvBool("INCREMENTAL_ENABLED", true),
 		},
 
 		Cascade: CascadeConfig{
@@ -253,6 +259,15 @@ func Load() (*Config, error) {
 	}
 	if cfg.Analysis.JobTimeout <= 0 {
 		cfg.Analysis.JobTimeout = 7200 * time.Second
+	}
+	if cfg.Analysis.MaxRetries < 0 {
+		cfg.Analysis.MaxRetries = 0
+	}
+	if cfg.Analysis.MaxRetries > 10 {
+		cfg.Analysis.MaxRetries = 10
+	}
+	for i, name := range cfg.Analysis.FallbackProviders {
+		cfg.Analysis.FallbackProviders[i] = strings.ToLower(strings.TrimSpace(name))
 	}
 
 	if cfg.Cascade.MaxParallel <= 0 {

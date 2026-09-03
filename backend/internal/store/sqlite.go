@@ -80,11 +80,33 @@ func (s *SQLiteStore) migrate() error {
 		updated_at DATETIME NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS commit_decisions (
+		source_key TEXT NOT NULL,
+		commit_hash TEXT NOT NULL,
+		decisions_json TEXT NOT NULL,
+		updated_at DATETIME NOT NULL,
+		PRIMARY KEY (source_key, commit_hash)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 	CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
 	`
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+
+	// Колонки usage добавляются к уже существующим таблицам (миграция без даунтайма).
+	for _, stmt := range []string{
+		`ALTER TABLE jobs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func newID() (string, error) {
@@ -125,8 +147,7 @@ func (s *SQLiteStore) CreateJob(req Request) (*Job, error) {
 
 func (s *SQLiteStore) GetJob(id string) (*Job, bool) {
 	row := s.db.QueryRow(
-		`SELECT id, status, created_at, started_at, finished_at, request_json, report_id, error, progress_json 
-		 FROM jobs WHERE id = ?`, id,
+		`SELECT id, status, created_at, started_at, finished_at, request_json, report_id, error, progress_json, prompt_tokens, completion_tokens, total_tokens FROM jobs WHERE id = ?`, id,
 	)
 	return s.scanJob(row)
 }
@@ -140,8 +161,7 @@ func (s *SQLiteStore) ListJobs(limit int) ([]*Job, error) {
 	}
 
 	rows, err := s.db.Query(
-		`SELECT id, status, created_at, started_at, finished_at, request_json, report_id, error, progress_json 
-		 FROM jobs ORDER BY created_at DESC LIMIT ?`, limit,
+		`SELECT id, status, created_at, started_at, finished_at, request_json, report_id, error, progress_json, prompt_tokens, completion_tokens, total_tokens FROM jobs ORDER BY created_at DESC LIMIT ?`, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -167,19 +187,23 @@ type rowScanner interface {
 
 func (s *SQLiteStore) scanJob(row rowScanner) (*Job, bool) {
 	var (
-		id           string
-		status       string
-		createdAt    time.Time
-		startedAt    sql.NullTime
-		finishedAt   sql.NullTime
-		requestJSON  string
-		reportID     sql.NullString
-		errorMsg     sql.NullString
-		progressJSON sql.NullString
+		id               string
+		status           string
+		createdAt        time.Time
+		startedAt        sql.NullTime
+		finishedAt       sql.NullTime
+		requestJSON      string
+		reportID         sql.NullString
+		errorMsg         sql.NullString
+		progressJSON     sql.NullString
+		promptTokens     int64
+		completionTokens int64
+		totalTokens      int64
 	)
 
 	err := row.Scan(&id, &status, &createdAt, &startedAt, &finishedAt,
-		&requestJSON, &reportID, &errorMsg, &progressJSON)
+		&requestJSON, &reportID, &errorMsg, &progressJSON,
+		&promptTokens, &completionTokens, &totalTokens)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, false
@@ -193,10 +217,13 @@ func (s *SQLiteStore) scanJob(row rowScanner) (*Job, bool) {
 	}
 
 	j := &Job{
-		ID:        id,
-		Status:    Status(status),
-		CreatedAt: createdAt,
-		Request:   req,
+		ID:               id,
+		Status:           Status(status),
+		CreatedAt:        createdAt,
+		Request:          req,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      totalTokens,
 	}
 
 	if startedAt.Valid {
@@ -223,19 +250,23 @@ func (s *SQLiteStore) scanJob(row rowScanner) (*Job, bool) {
 
 func (s *SQLiteStore) scanJobFromRows(rows *sql.Rows) (*Job, error) {
 	var (
-		id           string
-		status       string
-		createdAt    time.Time
-		startedAt    sql.NullTime
-		finishedAt   sql.NullTime
-		requestJSON  string
-		reportID     sql.NullString
-		errorMsg     sql.NullString
-		progressJSON sql.NullString
+		id               string
+		status           string
+		createdAt        time.Time
+		startedAt        sql.NullTime
+		finishedAt       sql.NullTime
+		requestJSON      string
+		reportID         sql.NullString
+		errorMsg         sql.NullString
+		progressJSON     sql.NullString
+		promptTokens     int64
+		completionTokens int64
+		totalTokens      int64
 	)
 
 	err := rows.Scan(&id, &status, &createdAt, &startedAt, &finishedAt,
-		&requestJSON, &reportID, &errorMsg, &progressJSON)
+		&requestJSON, &reportID, &errorMsg, &progressJSON,
+		&promptTokens, &completionTokens, &totalTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -246,10 +277,13 @@ func (s *SQLiteStore) scanJobFromRows(rows *sql.Rows) (*Job, error) {
 	}
 
 	j := &Job{
-		ID:        id,
-		Status:    Status(status),
-		CreatedAt: createdAt,
-		Request:   req,
+		ID:               id,
+		Status:           Status(status),
+		CreatedAt:        createdAt,
+		Request:          req,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      totalTokens,
 	}
 	if startedAt.Valid {
 		j.StartedAt = startedAt.Time
@@ -460,6 +494,101 @@ func (s *SQLiteStore) SaveProviderConfig(pc ProviderConfig) error {
 func (s *SQLiteStore) DeleteProviderConfig(name string) error {
 	_, err := s.db.Exec(`DELETE FROM provider_configs WHERE name = ?`, strings.TrimSpace(name))
 	return err
+}
+
+func (s *SQLiteStore) UpdateUsage(id string, prompt, completion, total int64) bool {
+	res, err := s.db.Exec(
+		`UPDATE jobs SET prompt_tokens = ?, completion_tokens = ?, total_tokens = ? WHERE id = ?`,
+		prompt, completion, total, id,
+	)
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n > 0
+}
+
+func (s *SQLiteStore) SaveCommitDecisions(sourceKey string, hashes []string, decisionsJSON []byte) error {
+	if strings.TrimSpace(sourceKey) == "" || len(hashes) == 0 || len(decisionsJSON) == 0 {
+		return nil
+	}
+
+	now := time.Now().UTC()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(
+		`INSERT INTO commit_decisions (source_key, commit_hash, decisions_json, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(source_key, commit_hash) DO UPDATE SET
+			decisions_json = excluded.decisions_json,
+			updated_at = excluded.updated_at`,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare stmt: %w", err)
+	}
+	defer stmt.Close()
+
+	for _, h := range hashes {
+		if h == "" {
+			continue
+		}
+		if _, err := stmt.Exec(sourceKey, h, string(decisionsJSON), now); err != nil {
+			return fmt.Errorf("upsert commit decisions: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) LoadCommitDecisions(sourceKey string, hashes []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(hashes))
+	if strings.TrimSpace(sourceKey) == "" || len(hashes) == 0 {
+		return out, nil
+	}
+
+	const chunkSize = 400
+	for start := 0; start < len(hashes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		chunk := hashes[start:end]
+
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, sourceKey)
+		for _, h := range chunk {
+			args = append(args, h)
+		}
+
+		rows, err := s.db.Query(
+			`SELECT commit_hash, decisions_json FROM commit_decisions WHERE source_key = ? AND commit_hash IN (`+placeholders+`)`,
+			args...,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		for rows.Next() {
+			var hash, data string
+			if err := rows.Scan(&hash, &data); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[hash] = []byte(data)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+
+	return out, nil
 }
 
 func scanProviderConfig(scan func(dest ...any) error) (ProviderConfig, error) {
