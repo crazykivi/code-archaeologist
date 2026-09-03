@@ -34,6 +34,12 @@ type Request struct {
 	Language   string `json:"language"`
 	Cascade    bool   `json:"cascade"`
 	Diff       bool   `json:"diff"`
+	ReportType string `json:"report_type,omitempty"`
+
+	Since      string `json:"since,omitempty"`
+	Until      string `json:"until,omitempty"`
+	FromCommit string `json:"from_commit,omitempty"`
+	ToCommit   string `json:"to_commit,omitempty"`
 }
 
 type Job struct {

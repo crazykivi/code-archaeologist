@@ -46,6 +46,12 @@ func (a *API) Analyze(c *gin.Context) {
 		Language   string `json:"language"`
 		Cascade    *bool  `json:"cascade"`
 		Diff       *bool  `json:"diff"`
+		ReportType string `json:"report_type"`
+
+		Since      string `json:"since"`
+		Until      string `json:"until"`
+		FromCommit string `json:"from_commit"`
+		ToCommit   string `json:"to_commit"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -87,6 +93,23 @@ func (a *API) Analyze(c *gin.Context) {
 		language = "ru"
 	}
 
+	reportType := analyzer.NormalizeReportType(req.ReportType)
+	if !analyzer.IsSupportedReportType(reportType) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported report type"})
+		return
+	}
+
+	filter := scanner.CommitFilter{
+		Since:      strings.TrimSpace(req.Since),
+		Until:      strings.TrimSpace(req.Until),
+		FromCommit: strings.TrimSpace(req.FromCommit),
+		ToCommit:   strings.TrimSpace(req.ToCommit),
+	}
+	if err := scanner.ValidateCommitFilter(filter); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 0
@@ -114,6 +137,11 @@ func (a *API) Analyze(c *gin.Context) {
 		Language:   language,
 		Cascade:    cascade,
 		Diff:       diff,
+		ReportType: reportType,
+		Since:      filter.Since,
+		Until:      filter.Until,
+		FromCommit: filter.FromCommit,
+		ToCommit:   filter.ToCommit,
 	}
 
 	job, err := a.store.CreateJob(jobReq)
@@ -214,7 +242,12 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 		limit = a.cfg.Git.MaxCommits
 	}
 
-	commits, err := a.scanner.Commits(ctx, repo.Path, limit)
+	commits, err := a.scanner.Commits(ctx, repo.Path, limit, scanner.CommitFilter{
+		Since:      req.Since,
+		Until:      req.Until,
+		FromCommit: req.FromCommit,
+		ToCommit:   req.ToCommit,
+	})
 	if err != nil {
 		a.failJob(id, "git history extraction failed", err)
 		return
@@ -269,6 +302,11 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 		ProviderName: provider.Name(),
 		Model:        modelName,
 		Language:     req.Language,
+		ReportType:   req.ReportType,
+		Since:        req.Since,
+		Until:        req.Until,
+		FromCommit:   req.FromCommit,
+		ToCommit:     req.ToCommit,
 	}
 
 	var markdown string

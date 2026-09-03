@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +28,52 @@ type Commit struct {
 type CommitWithDiff struct {
 	Commit
 	Diff string
+}
+
+// CommitFilter ограничивает выборку git log. Пустые поля означают «без ограничения».
+type CommitFilter struct {
+	Since      string // YYYY-MM-DD
+	Until      string // YYYY-MM-DD
+	FromCommit string // ref-исключение диапазона (хэш, тег, ветка)
+	ToCommit   string // ref-вершина диапазона (хэш, тег, ветка)
+}
+
+var (
+	safeRefRe  = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$`)
+	safeDateRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+)
+
+// ValidateCommitFilter отклоняет значения, которые нельзя безопасно передать
+// в argv для git (инъекция опций, диапазонные операторы, мусорные даты).
+func ValidateCommitFilter(f CommitFilter) error {
+	for _, r := range []struct{ name, val string }{
+		{"from_commit", f.FromCommit},
+		{"to_commit", f.ToCommit},
+	} {
+		if r.val == "" {
+			continue
+		}
+		if strings.Contains(r.val, "..") {
+			return fmt.Errorf("%s must not contain '..'", r.name)
+		}
+		if !safeRefRe.MatchString(r.val) {
+			return fmt.Errorf("invalid %s", r.name)
+		}
+	}
+
+	for _, d := range []struct{ name, val string }{
+		{"since", f.Since},
+		{"until", f.Until},
+	} {
+		if d.val == "" {
+			continue
+		}
+		if !safeDateRe.MatchString(d.val) {
+			return fmt.Errorf("%s must be in YYYY-MM-DD format", d.name)
+		}
+	}
+
+	return nil
 }
 
 type PreparedRepo struct {
@@ -104,13 +151,17 @@ func (s *Service) Prepare(ctx context.Context, sourceType, source string) (*Prep
 	}
 }
 
-func (s *Service) Commits(ctx context.Context, repoPath string, limit int) ([]Commit, error) {
+func (s *Service) Commits(ctx context.Context, repoPath string, limit int, filter CommitFilter) ([]Commit, error) {
 	repoPath = strings.TrimSpace(repoPath)
 	if repoPath == "" {
 		return nil, errors.New("repository path is empty")
 	}
 	if strings.HasPrefix(repoPath, "-") {
 		return nil, errors.New("repository path must not start with '-'")
+	}
+
+	if err := ValidateCommitFilter(filter); err != nil {
+		return nil, err
 	}
 
 	if limit <= 0 {
@@ -125,9 +176,29 @@ func (s *Service) Commits(ctx context.Context, repoPath string, limit int) ([]Co
 		"--no-pager",
 		"log",
 		"--no-color",
+	}
+
+	// Семантика диапазона: from..to, from..HEAD либо «всё до to».
+	switch {
+	case filter.FromCommit != "" && filter.ToCommit != "":
+		args = append(args, filter.FromCommit+".."+filter.ToCommit)
+	case filter.FromCommit != "":
+		args = append(args, filter.FromCommit+"..HEAD")
+	case filter.ToCommit != "":
+		args = append(args, filter.ToCommit)
+	}
+
+	if filter.Since != "" {
+		args = append(args, "--since="+filter.Since)
+	}
+	if filter.Until != "" {
+		args = append(args, "--until="+filter.Until)
+	}
+
+	args = append(args,
 		fmt.Sprintf("--max-count=%d", limit),
 		"--pretty=format:%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e",
-	}
+	)
 
 	out, err := runGit(ctx, s.cfg.Timeout, args...)
 	if err != nil {

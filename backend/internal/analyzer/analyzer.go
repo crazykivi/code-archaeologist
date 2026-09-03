@@ -39,6 +39,36 @@ type Params struct {
 	ProviderName string
 	Model        string
 	Language     string
+	ReportType   string
+
+	Since      string
+	Until      string
+	FromCommit string
+	ToCommit   string
+}
+
+const (
+	ReportDecisions    = "decisions"
+	ReportArchitecture = "architecture"
+	ReportTechDebt     = "tech_debt"
+	ReportTeam         = "team"
+)
+
+func NormalizeReportType(t string) string {
+	t = strings.ToLower(strings.TrimSpace(t))
+	if t == "" {
+		return ReportDecisions
+	}
+	return t
+}
+
+func IsSupportedReportType(t string) bool {
+	switch NormalizeReportType(t) {
+	case ReportDecisions, ReportArchitecture, ReportTechDebt, ReportTeam:
+		return true
+	default:
+		return false
+	}
 }
 
 func Run(
@@ -335,6 +365,52 @@ func backfillBatchInfo(decisions []Decision, batch []scanner.CommitWithDiff) {
 	}
 }
 
+type reportMetaInfo struct {
+	Title        string
+	Section      string
+	ItemsLabel   string
+	NothingLabel string
+	FieldLabel   string
+}
+
+var reportMeta = map[string]reportMetaInfo{
+	ReportDecisions: {
+		Title:        "История принятия решений",
+		Section:      "Ключевые решения",
+		ItemsLabel:   "Найдено решений",
+		NothingLabel: "Решения не найдены.",
+		FieldLabel:   "Решение",
+	},
+	ReportArchitecture: {
+		Title:        "Эволюция архитектуры",
+		Section:      "Архитектурные изменения",
+		ItemsLabel:   "Найдено архитектурных изменений",
+		NothingLabel: "Архитектурные изменения не найдены.",
+		FieldLabel:   "Изменение",
+	},
+	ReportTechDebt: {
+		Title:        "Технический долг в истории",
+		Section:      "Записи о долге",
+		ItemsLabel:   "Найдено записей о долге",
+		NothingLabel: "Записи о долге не найдены.",
+		FieldLabel:   "Факт",
+	},
+	ReportTeam: {
+		Title:        "Анализ команды и вклада",
+		Section:      "Наблюдения",
+		ItemsLabel:   "Найдено наблюдений",
+		NothingLabel: "Наблюдения не найдены.",
+		FieldLabel:   "Вклад",
+	},
+}
+
+func metaFor(reportType string) reportMetaInfo {
+	if meta, ok := reportMeta[NormalizeReportType(reportType)]; ok {
+		return meta
+	}
+	return reportMeta[ReportDecisions]
+}
+
 func renderReport(p Params, overview string, decisions []Decision, commitCount int) string {
 	var b strings.Builder
 
@@ -343,22 +419,45 @@ func renderReport(p Params, overview string, decisions []Decision, commitCount i
 		model = "default"
 	}
 
-	b.WriteString("# История принятия решений\n\n")
+	meta := metaFor(p.ReportType)
+
+	b.WriteString("# " + meta.Title + "\n\n")
 	fmt.Fprintf(&b, "- Источник: %s (%s)\n", p.Source, p.SourceType)
 	fmt.Fprintf(&b, "- Сгенерировано: %s\n", time.Now().UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, "- Провайдер: %s\n", p.ProviderName)
 	fmt.Fprintf(&b, "- Модель: %s\n", model)
 	fmt.Fprintf(&b, "- Проанализировано коммитов: %d\n", commitCount)
-	fmt.Fprintf(&b, "- Найдено решений: %d\n\n", len(decisions))
+
+	if p.Since != "" || p.Until != "" {
+		since := p.Since
+		if since == "" {
+			since = "…"
+		}
+		until := p.Until
+		if until == "" {
+			until = "…"
+		}
+		fmt.Fprintf(&b, "- Период: %s — %s\n", since, until)
+	}
+	switch {
+	case p.FromCommit != "" && p.ToCommit != "":
+		fmt.Fprintf(&b, "- Диапазон коммитов: %s..%s\n", p.FromCommit, p.ToCommit)
+	case p.FromCommit != "":
+		fmt.Fprintf(&b, "- Диапазон коммитов: %s..HEAD\n", p.FromCommit)
+	case p.ToCommit != "":
+		fmt.Fprintf(&b, "- Диапазон коммитов: до %s\n", p.ToCommit)
+	}
+
+	fmt.Fprintf(&b, "- %s: %d\n\n", meta.ItemsLabel, len(decisions))
 
 	if overview != "" {
 		b.WriteString("## Обзор изменений проекта\n\n")
 		fmt.Fprintf(&b, "%s\n\n", overview)
-		b.WriteString("## Ключевые решения\n\n")
+		b.WriteString("## " + meta.Section + "\n\n")
 	}
 
 	if len(decisions) == 0 {
-		b.WriteString("Решения не найдены.\n")
+		b.WriteString(meta.NothingLabel + "\n")
 		return b.String()
 	}
 
@@ -391,7 +490,7 @@ func renderReport(p Params, overview string, decisions []Decision, commitCount i
 		b.WriteString("\n")
 
 		if d.Decision != "" {
-			fmt.Fprintf(&b, "**Решение:** %s\n\n", d.Decision)
+			fmt.Fprintf(&b, "**%s:** %s\n\n", meta.FieldLabel, d.Decision)
 		}
 		if d.Rationale != "" {
 			fmt.Fprintf(&b, "**Обоснование:** %s\n\n", d.Rationale)
@@ -407,23 +506,28 @@ func renderReport(p Params, overview string, decisions []Decision, commitCount i
 func buildMessages(p Params, batch []scanner.CommitWithDiff) []llm.Message {
 	type commitView struct {
 		Hash    string `json:"hash"`
-		Author  string `json:"author"`
+		Author  string `json:"author,omitempty"`
 		Date    string `json:"date"`
 		Subject string `json:"subject"`
 		Body    string `json:"body,omitempty"`
 		Diff    string `json:"diff,omitempty"`
 	}
 
+	showAuthor := NormalizeReportType(p.ReportType) == ReportTeam
+
 	views := make([]commitView, 0, len(batch))
 	for _, c := range batch {
-		views = append(views, commitView{
+		v := commitView{
 			Hash:    shortHash(c.Hash),
-			Author:  c.AuthorName,
 			Date:    c.Date,
 			Subject: c.Subject,
 			Body:    truncateText(c.Body, 800),
 			Diff:    truncateText(c.Diff, 2000),
-		})
+		}
+		if showAuthor {
+			v.Author = c.AuthorName
+		}
+		views = append(views, v)
 	}
 
 	data, err := json.Marshal(views)
@@ -431,8 +535,9 @@ func buildMessages(p Params, batch []scanner.CommitWithDiff) []llm.Message {
 		data = []byte("[]")
 	}
 
-	system := fmt.Sprintf(systemPromptTemplate, languageLabel(p.Language))
-	user := fmt.Sprintf(userPromptTemplate, p.SourceType, p.Source, string(data))
+	set := promptsFor(p.ReportType)
+	system := fmt.Sprintf(set.system, languageLabel(p.Language))
+	user := fmt.Sprintf(baseUserPrompt, p.SourceType, p.Source, string(data), set.instruction)
 
 	return []llm.Message{
 		{Role: "system", Content: system},
@@ -560,7 +665,8 @@ func truncateText(s string, limit int) string {
 	return string(r[:limit]) + "…"
 }
 
-const systemPromptTemplate = `Ты — строгий и беспристрастный парсер Git-истории. Твоя единственная задача — зафиксировать ФАКТЫ изменений в коде.
+// Общая жёсткая основа для всех типов отчётов: только факты из diff/сообщений.
+const baseFactsPrompt = `Ты — строгий и беспристрастный парсер Git-истории. Твоя единственная задача — зафиксировать ФАКТЫ изменений в коде.
 
 ЖЕСТКИЕ ЗАПРЕТЫ (Нарушение = провал):
 1. ЗАПРЕЩЕНО писать "воду", лирику, оценочные суждения ("хороший код", "монолит", "улучшили", "стало чище", "архитектурный компромисс").
@@ -589,13 +695,59 @@ const systemPromptTemplate = `Ты — строгий и беспристрас�
 
 Язык ответа: %s.`
 
-const userPromptTemplate = `Репозиторий: %s (%s)
+const baseUserPrompt = `Репозиторий: %s (%s)
 
 Коммиты с изменениями кода в JSON:
 %s
 
-Собери технические решения, которые можно обоснованно извлечь из этих коммитов.
+Задача: %s
+
 Верни только JSON-массив.`
+
+type promptSet struct {
+	system      string
+	instruction string
+}
+
+var reportPrompts = map[string]promptSet{
+	ReportDecisions: {
+		system: baseFactsPrompt,
+		instruction: "Собери технические решения, которые можно обоснованно извлечь из этих коммитов",
+	},
+	ReportArchitecture: {
+		system: baseFactsPrompt + `
+
+СПЕЦИАЛИЗАЦИЯ — АРХИТЕКТУРА:
+Фиксируй только структурные изменения: появление и удаление модулей и слоёв, смена каркасных фреймворков и библиотек, изменение схемы данных, разделение и слияние сервисов, смена протоколов взаимодействия. Мелкие правки внутри одного файла без структурного значения пропускай.
+В "tags" используй метки: "layer", "framework", "data-model", "integration", "build".`,
+		instruction: "Собери архитектурные изменения (структурные сдвиги уровня модулей, слоёв, фреймворков, схемы данных)",
+	},
+	ReportTechDebt: {
+		system: baseFactsPrompt + `
+
+СПЕЦИАЛИЗАЦИЯ — ТЕХНИЧЕСКИЙ ДОЛГ:
+Фиксируй только следы долга и его погашения: пометки TODO, FIXME, HACK, XXX, WORKAROUND; откат изменений (revert); отключенные и пропущенные тесты; хотфиксы; дублирование кода; закомментированный код.
+В "decision" пиши, что именно появилось или что было устранено. В "tags" используй метки: "todo", "fixme", "hack", "workaround", "revert", "skipped-test", "hotfix". Коммиты без признаков долга пропускай.`,
+		instruction: "Собери записи о техническом долге и его погашении (TODO/FIXME/HACK, revert-ы, отключенные тесты, workaround-ы, хотфиксы)",
+	},
+	ReportTeam: {
+		system: baseFactsPrompt + `
+
+СПЕЦИАЛИЗАЦИЯ — КОМАНДА И ВКЛАД:
+Анализируй вклад участников по полю "author" из входных данных. Группируй наблюдения по подсистемам, а не по отдельным коммитам.
+Фиксируй: кто какие подсистемы и модули менял; зоны концентрации изменений у одного автора; соотношение фич, фиксов и рефакторинга по сообщениям коммитов; bus-фактор — сколько авторов меняли каждый затронутый модуль.
+Не выдумывай имена: используй только те, что есть во входных данных. Персональных оценок не давай — только фактическое распределение.
+В "title" указывай автора или область (например: "Автор X: зона ответственности"). В "impact" перечисляй модули, где активность максимальна.`,
+		instruction: "Проанализируй вклад авторов: зоны ответственности, специализацию, соотношение типов коммитов, bus-фактор по затронутым модулям",
+	},
+}
+
+func promptsFor(reportType string) promptSet {
+	if set, ok := reportPrompts[NormalizeReportType(reportType)]; ok {
+		return set
+	}
+	return reportPrompts[ReportDecisions]
+}
 
 const reduceSystemPrompt = `Ты — строгий редактор технической документации.
 Твоя задача:
