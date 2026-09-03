@@ -1,3 +1,5 @@
+export type ReportType = 'decisions' | 'architecture' | 'tech_debt' | 'team'
+
 export interface Job {
   id: string
   status: 'queued' | 'running' | 'completed' | 'failed'
@@ -13,6 +15,11 @@ export interface Job {
     language: string
     cascade: boolean
     diff: boolean
+    report_type?: ReportType
+    since?: string
+    until?: string
+    from_commit?: string
+    to_commit?: string
   }
   report_id?: string
   error?: string
@@ -54,4 +61,9 @@ export interface AnalyzeRequest {
   language?: string
   cascade?: boolean
   diff?: boolean
+  report_type?: ReportType
+  since?: string
+  until?: string
+  from_commit?: string
+  to_commit?: string
 }

@@ -59,7 +59,12 @@
                 {{ job.request.source }}
               </p>
               <p class="mt-1 text-xs text-gray-500">
-                {{ job.request.provider }} · {{ job.request.limit || "все" }} коммитов
+                {{ reportTypeText(job.request.report_type) }} ·
+                {{ job.request.provider }} ·
+                {{ job.request.limit || "все" }} коммитов
+                <template v-if="filterText(job.request)">
+                  · {{ filterText(job.request) }}
+                </template>
               </p>
             </div>
             <span :class="statusBadgeClass(job.status)">{{ statusText(job.status) }}</span>
@@ -81,7 +86,7 @@
               <div class="progress-track">
                 <div
                   class="progress-bar progress-gradient"
-                  :style="{ width: `${(job.progress.processed_items / job.progress.total_commits) * 100}%` }"
+                  :style="{ width: `${(job.progress.processed_items ?? 0) / job.progress.total_commits * 100}%` }"
                 ></div>
               </div>
               <p class="mt-2 text-right text-xs text-gray-500">
@@ -93,7 +98,7 @@
               <div class="progress-track">
                 <div
                   class="progress-bar progress-gradient"
-                  :style="{ width: `${(job.progress.done_batches / job.progress.total_batches) * 100}%` }"
+                  :style="{ width: `${(job.progress.done_batches ?? 0) / job.progress.total_batches * 100}%` }"
                 ></div>
               </div>
               <p class="mt-2 text-right text-xs text-gray-500">
@@ -105,7 +110,7 @@
               <div class="progress-track">
                 <div
                   class="progress-bar progress-gradient"
-                  :style="{ width: `${(job.progress.done_reduce / job.progress.total_reduce) * 100}%` }"
+                  :style="{ width: `${(job.progress.done_reduce ?? 0) / job.progress.total_reduce * 100}%` }"
                 ></div>
               </div>
               <p class="mt-2 text-right text-xs text-gray-500">
@@ -138,8 +143,13 @@
                 {{ job.request.source }}
               </p>
               <p class="mt-1 text-xs text-gray-500">
-                {{ job.request.provider }} · {{ job.request.limit || "все" }} коммитов ·
-                {{ formatDate(job.created_at) }}
+                {{ reportTypeText(job.request.report_type) }} ·
+                {{ job.request.provider }} ·
+                {{ job.request.limit || "все" }} коммитов
+                <template v-if="filterText(job.request)">
+                  · {{ filterText(job.request) }}
+                </template>
+                · {{ formatDate(job.created_at) }}
               </p>
             </div>
 
@@ -210,6 +220,7 @@ import { computed, ref } from "vue";
 import { useRouter } from "vue-router";
 import { useJobsStore } from "@/stores/jobs";
 import { getReport, deleteJobApi } from "@/services/api";
+import type { Job } from "@/types";
 
 const router = useRouter();
 const jobsStore = useJobsStore();
@@ -247,6 +258,30 @@ function statusText(status: string) {
 
 function formatDate(dateString: string) {
   return new Date(dateString).toLocaleString("ru-RU");
+}
+
+const reportTypeLabels: Record<string, string> = {
+  decisions: "Решения",
+  architecture: "Архитектура",
+  tech_debt: "Тех. долг",
+  team: "Команда",
+};
+
+function reportTypeText(type?: string) {
+  return reportTypeLabels[type ?? ""] ?? "Решения";
+}
+
+function filterText(request: Job["request"]) {
+  const parts: string[] = [];
+  if (request.since || request.until) {
+    parts.push(`${request.since || "…"} — ${request.until || "…"}`);
+  }
+  if (request.from_commit || request.to_commit) {
+    parts.push(
+      `${request.from_commit || ""}…${request.to_commit || "HEAD"}`
+    );
+  }
+  return parts.join(" · ");
 }
 
 function viewReport(reportId: string) {
