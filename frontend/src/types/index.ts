@@ -16,6 +16,7 @@ export interface Job {
     cascade: boolean
     diff: boolean
     report_type?: ReportType
+    incremental?: boolean
     since?: string
     until?: string
     from_commit?: string
@@ -34,6 +35,9 @@ export interface Job {
     total_reduce?: number
     done_reduce?: number
   }
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
 }
 
 export interface Report {
@@ -75,6 +79,7 @@ export interface AnalyzeRequest {
   cascade?: boolean
   diff?: boolean
   report_type?: ReportType
+  incremental?: boolean
   since?: string
   until?: string
   from_commit?: string

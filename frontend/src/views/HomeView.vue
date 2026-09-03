@@ -188,6 +188,23 @@
               Анализ diff
             </span>
           </label>
+
+          <label class="group flex cursor-pointer items-center gap-3">
+            <div class="relative">
+              <input v-model="form.incremental" type="checkbox" class="peer sr-only" />
+              <div
+                class="h-5 w-9 rounded-full bg-white/[0.08] transition-colors peer-checked:bg-accent-500"
+              ></div>
+              <div
+                class="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-gray-400 transition-all peer-checked:translate-x-4 peer-checked:bg-white"
+              ></div>
+            </div>
+            <span
+              class="text-sm text-gray-300 transition-colors group-hover:text-gray-100"
+            >
+              Инкрементально
+            </span>
+          </label>
         </div>
 
         <div class="flex items-center justify-end border-t border-white/[0.04] pt-6">
@@ -332,6 +349,7 @@ const form = ref<AnalyzeRequest>({
   limit: 0,
   cascade: true,
   diff: true,
+  incremental: true,
   report_type: "decisions",
   since: "",
   until: "",
@@ -374,6 +392,7 @@ async function handleSubmit() {
         language: "ru",
         cascade: form.value.cascade ?? true,
         diff: form.value.diff ?? true,
+        incremental: form.value.incremental ?? true,
       },
     };
     jobsStore.addJob(job);

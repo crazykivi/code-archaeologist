@@ -151,6 +151,14 @@
                 </template>
                 · {{ formatDate(job.created_at) }}
               </p>
+              <p
+                v-if="job.total_tokens"
+                class="mt-1 text-xs text-gray-600"
+                title="Prompt / completion / всего"
+              >
+                Токены: {{ job.prompt_tokens ?? 0 }} / {{ job.completion_tokens ?? 0 }} /
+                <span class="text-gray-400">{{ job.total_tokens }}</span>
+              </p>
             </div>
 
             <div class="flex items-center gap-2">

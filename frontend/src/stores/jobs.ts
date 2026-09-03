@@ -3,9 +3,14 @@ import { ref, computed } from 'vue'
 import type { Job } from '@/types'
 import { getJob } from '@/services/api'
 
+function isTerminal(status: Job['status']): boolean {
+  return status === 'completed' || status === 'failed'
+}
+
 export const useJobsStore = defineStore('jobs', () => {
     const jobs = ref<Map<string, Job>>(new Map())
     const pollingInterval = ref<number | null>(null)
+    const watchers = ref<Map<string, EventSource>>(new Map())
 
     const activeJobs = computed(() =>
         Array.from(jobs.value.values()).filter(j => j.status === 'queued' || j.status === 'running')
@@ -20,12 +25,15 @@ export const useJobsStore = defineStore('jobs', () => {
     function addJob(job: Job) {
         jobs.value.set(job.id, job)
         saveToStorage()
-        startPolling()
+        startWatching(job.id)
     }
 
     function updateJob(job: Job) {
         jobs.value.set(job.id, job)
         saveToStorage()
+        if (isTerminal(job.status)) {
+            stopWatching(job.id)
+        }
     }
 
     async function refreshJob(id: string) {
@@ -38,6 +46,74 @@ export const useJobsStore = defineStore('jobs', () => {
             return null
         }
     }
+
+    // --- SSE: живой прогресс, polling остаётся фолбэком ---
+
+    function startWatching(id: string) {
+        if (watchers.value.has(id)) return
+
+        const es = new EventSource(`/api/v1/jobs/${id}/events`)
+        watchers.value.set(id, es)
+
+        es.onmessage = (event: MessageEvent) => {
+            try {
+                const payload = JSON.parse(event.data) as {
+                    type: string
+                    status?: Job['status']
+                    progress?: Job['progress']
+                    report_id?: string
+                    error?: string
+                }
+
+                const current = jobs.value.get(id)
+                if (!current) {
+                    stopWatching(id)
+                    return
+                }
+
+                if (payload.type === 'progress') {
+                    updateJob({ ...current, status: 'running', progress: payload.progress ?? current.progress })
+                } else if (payload.type === 'status' || payload.type === 'snapshot') {
+                    const status = payload.status ?? current.status
+                    updateJob({
+                        ...current,
+                        status,
+                        progress: payload.progress ?? current.progress,
+                        report_id: payload.report_id ?? current.report_id,
+                        error: payload.error ?? current.error
+                    })
+                    if (isTerminal(status)) {
+                        stopWatching(id)
+                        refreshJob(id)
+                    }
+                }
+            } catch (err) {
+                console.warn('Failed to parse SSE payload:', err)
+            }
+        }
+
+        es.onerror = () => {
+            // Сервер недоступен или соединение оборвалось — переходим на polling.
+            stopWatching(id)
+            startPolling()
+        }
+    }
+
+    function stopWatching(id: string) {
+        const es = watchers.value.get(id)
+        if (es) {
+            es.close()
+            watchers.value.delete(id)
+        }
+    }
+
+    function stopAllWatching() {
+        for (const [id] of watchers.value) {
+            stopWatching(id)
+        }
+    }
+
+    // --- Polling fallback ---
 
     function startPolling() {
         if (pollingInterval.value) return
@@ -62,9 +138,21 @@ export const useJobsStore = defineStore('jobs', () => {
         }
     }
 
+    // --- Persistence ---
+
+    let saveTimer: number | null = null
+
     function saveToStorage() {
-        const jobsArray = Array.from(jobs.value.values())
-        localStorage.setItem('jobs', JSON.stringify(jobsArray))
+        if (saveTimer !== null) return
+        saveTimer = window.setTimeout(() => {
+            saveTimer = null
+            try {
+                const jobsArray = Array.from(jobs.value.values())
+                localStorage.setItem('jobs', JSON.stringify(jobsArray))
+            } catch (err) {
+                console.warn('Failed to persist jobs:', err)
+            }
+        }, 500)
     }
 
     async function loadFromStorage() {
@@ -76,24 +164,33 @@ export const useJobsStore = defineStore('jobs', () => {
             console.warn('Failed to load jobs from backend, falling back to localStorage:', err)
             const stored = localStorage.getItem('jobs')
             if (stored) {
-                const jobsArray = JSON.parse(stored) as Job[]
-                jobs.value = new Map(jobsArray.map(j => [j.id, j]))
+                try {
+                    const jobsArray = JSON.parse(stored) as Job[]
+                    jobs.value = new Map(jobsArray.map(j => [j.id, j]))
+                } catch (parseErr) {
+                    console.warn('Failed to parse stored jobs:', parseErr)
+                    localStorage.removeItem('jobs')
+                }
             }
         }
 
+        for (const job of activeJobs.value) {
+            startWatching(job.id)
+        }
         if (activeJobs.value.length > 0) {
             startPolling()
         }
     }
 
     function clearJob(id: string) {
+        stopWatching(id)
         jobs.value.delete(id)
         saveToStorage()
     }
 
     function clearAllCompleted() {
         for (const [id, job] of jobs.value.entries()) {
-            if (job.status === 'completed' || job.status === 'failed') {
+            if (isTerminal(job.status)) {
                 jobs.value.delete(id)
             }
         }
@@ -110,6 +207,7 @@ export const useJobsStore = defineStore('jobs', () => {
         updateJob,
         refreshJob,
         clearJob,
-        clearAllCompleted
+        clearAllCompleted,
+        stopAllWatching
     }
 })
