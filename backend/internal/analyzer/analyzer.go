@@ -45,6 +45,11 @@ type Params struct {
 	Until      string
 	FromCommit string
 	ToCommit   string
+
+	// SourceKey + Cache + Incremental — инкрементальный анализ.
+	SourceKey   string
+	Incremental bool
+	Cache       DecisionCache
 }
 
 const (
@@ -71,6 +76,15 @@ func IsSupportedReportType(t string) bool {
 	}
 }
 
+// DecisionCache — кэш уже извлечённых решений по коммитам (инкрементальный анализ).
+// Реализация в handlers поверх store; analyzer работает только с JSON.
+type DecisionCache interface {
+	// Load возвращает кэшированный JSON решений для каждого из переданных хэшей.
+	Load(sourceKey string, hashes []string) (map[string][]byte, error)
+	// Save сохраняет JSON решений, полученных из батча коммитов.
+	Save(sourceKey string, hashes []string, decisionsJSON []byte) error
+}
+
 func Run(
 	ctx context.Context,
 	provider llm.Provider,
@@ -90,7 +104,7 @@ func Run(
 			end = len(commits)
 		}
 
-		parsed, err := analyzeBatch(ctx, provider, p, commits[start:end])
+		parsed, _, err := runBatch(ctx, provider, p, commits[start:end])
 		if err != nil {
 			return "", err
 		}
@@ -115,6 +129,7 @@ func RunCascade(
 
 	totalBatches := (len(commits) + batchSize - 1) / batchSize
 	allDecisions := make([][]Decision, totalBatches)
+	allCachedBatches := 0
 
 	sem := make(chan struct{}, cascadeCfg.MaxParallel)
 	var wg sync.WaitGroup
@@ -136,7 +151,7 @@ func RunCascade(
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			decisions, err := analyzeBatch(ctx, provider, p, commits[s:e])
+			decisions, cachedAll, err := runBatch(ctx, provider, p, commits[s:e])
 
 			mu.Lock()
 			if err != nil {
@@ -147,6 +162,9 @@ func RunCascade(
 				decisions = []Decision{}
 			}
 			allDecisions[idx] = decisions
+			if cachedAll && err == nil {
+				allCachedBatches++
+			}
 
 			doneBatches := 0
 			for _, d := range allDecisions {
@@ -171,6 +189,15 @@ func RunCascade(
 	var flatDecisions []Decision
 	for _, d := range allDecisions {
 		flatDecisions = append(flatDecisions, d...)
+	}
+
+	// Полный кэш-хит: решения уже консолидированы ранее, reduce не нужен.
+	if allCachedBatches == totalBatches && len(flatDecisions) > 0 {
+		if onProgress != nil {
+			onProgress("finalize", "Генерация финального отчёта", "Все данные взяты из кэша", totalBatches, totalBatches, 0, 0)
+		}
+		overview := generateOverview(ctx, provider, p, flatDecisions)
+		return renderReport(p, overview, flatDecisions, len(commits)), nil
 	}
 
 	reduceSize := cascadeCfg.ReduceSize
@@ -236,7 +263,7 @@ func RunCascade(
 func analyzeBatch(ctx context.Context, provider llm.Provider, p Params, batch []scanner.CommitWithDiff) ([]Decision, error) {
 	messages := buildMessages(p, batch)
 
-	content, err := provider.Chat(ctx, messages, llm.ChatOptions{
+	resp, err := provider.Chat(ctx, messages, llm.ChatOptions{
 		Model:       p.Model,
 		Temperature: 0.1,
 	})
@@ -244,20 +271,84 @@ func analyzeBatch(ctx context.Context, provider llm.Provider, p Params, batch []
 		return nil, err
 	}
 
-	decisions, err := ParseDecisions(content)
+	decisions, err := ParseDecisions(resp.Content)
 	if err != nil {
 		log.Printf("[Analyzer] failed to parse LLM JSON: %v", err)
-		decisions = []Decision{fallbackDecision(content)}
+		decisions = []Decision{fallbackDecision(resp.Content)}
 	}
 
 	backfillBatchInfo(decisions, batch)
 	return decisions, nil
 }
 
+// runBatch — обёртка analyzeBatch с инкрементальным кэшем.
+// Возвращает решения и признак полного кэш-хита (LLM не вызывался).
+func runBatch(ctx context.Context, provider llm.Provider, p Params, batch []scanner.CommitWithDiff) ([]Decision, bool, error) {
+	if p.Cache == nil || !p.Incremental || p.SourceKey == "" {
+		d, err := analyzeBatch(ctx, provider, p, batch)
+		return d, false, err
+	}
+
+	hashes := make([]string, len(batch))
+	for i, c := range batch {
+		hashes[i] = c.Hash
+	}
+
+	cached, err := p.Cache.Load(p.SourceKey, hashes)
+	if err != nil {
+		log.Printf("[Analyzer] decision cache load failed, falling back to full analysis: %v", err)
+		d, err := analyzeBatch(ctx, provider, p, batch)
+		return d, false, err
+	}
+
+	var freshBatch []scanner.CommitWithDiff
+	out := make([]Decision, 0, len(batch))
+	cachedAll := true
+
+	for i, c := range batch {
+		if raw, ok := cached[c.Hash]; ok {
+			var ds []Decision
+			if jsonErr := json.Unmarshal(raw, &ds); jsonErr == nil && len(ds) > 0 {
+				out = append(out, ds...)
+				continue
+			}
+		}
+		cachedAll = false
+		freshBatch = append(freshBatch, c)
+		_ = i
+	}
+
+	if len(freshBatch) == 0 {
+		return out, true, nil
+	}
+
+	freshDecisions, err := analyzeBatch(ctx, provider, p, freshBatch)
+	if err != nil {
+		return nil, false, err
+	}
+	out = append(out, freshDecisions...)
+
+	if data, jsonErr := json.Marshal(freshDecisions); jsonErr == nil {
+		if saveErr := p.Cache.Save(p.SourceKey, hashesFor(freshBatch), data); saveErr != nil {
+			log.Printf("[Analyzer] decision cache save failed: %v", saveErr)
+		}
+	}
+
+	return out, cachedAll, nil
+}
+
+func hashesFor(batch []scanner.CommitWithDiff) []string {
+	hashes := make([]string, len(batch))
+	for i, c := range batch {
+		hashes[i] = c.Hash
+	}
+	return hashes
+}
+
 func reduceBatch(ctx context.Context, provider llm.Provider, p Params, decisions []Decision) ([]Decision, error) {
 	messages := buildReduceMessages(p, decisions)
 
-	content, err := provider.Chat(ctx, messages, llm.ChatOptions{
+	resp, err := provider.Chat(ctx, messages, llm.ChatOptions{
 		Model:       p.Model,
 		Temperature: 0.05,
 	})
@@ -265,7 +356,7 @@ func reduceBatch(ctx context.Context, provider llm.Provider, p Params, decisions
 		return nil, err
 	}
 
-	reduced, err := ParseDecisions(content)
+	reduced, err := ParseDecisions(resp.Content)
 	if err != nil {
 		return decisions, nil
 	}
@@ -280,7 +371,7 @@ func generateOverview(ctx context.Context, provider llm.Provider, p Params, deci
 
 	messages := buildFinalizeMessages(p, decisions)
 
-	content, err := provider.Chat(ctx, messages, llm.ChatOptions{
+	resp, err := provider.Chat(ctx, messages, llm.ChatOptions{
 		Model:       p.Model,
 		Temperature: 0.1,
 	})
@@ -292,7 +383,7 @@ func generateOverview(ctx context.Context, provider llm.Provider, p Params, deci
 	var res struct {
 		Overview string `json:"overview"`
 	}
-	if err := json.Unmarshal([]byte(extractJSON(content)), &res); err != nil {
+	if err := json.Unmarshal([]byte(extractJSON(resp.Content)), &res); err != nil {
 		log.Printf("[Analyzer] failed to parse overview JSON: %v", err)
 		return ""
 	}
