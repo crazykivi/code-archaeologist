@@ -40,6 +40,15 @@
                   {{ activeJobsCount }}
                 </span>
               </router-link>
+              <router-link
+                to="/settings"
+                class="flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition-all duration-200"
+                :class="$route.path === '/settings'
+                  ? 'bg-accent-500/10 text-accent-400'
+                  : 'text-gray-400 hover:bg-white/[0.04] hover:text-gray-200'"
+              >
+                Настройки
+              </router-link>
             </div>
           </div>
 

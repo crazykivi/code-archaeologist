@@ -45,6 +45,19 @@ export interface Report {
 export interface Provider {
   name: string
   configured: boolean
+  base_url?: string
+  model?: string
+  api_key_set?: boolean
+  custom?: boolean
+  overridden?: boolean
+  headers?: Record<string, string>
+}
+
+export interface ProviderUpdateInput {
+  base_url?: string | null
+  model?: string | null
+  api_key?: string | null
+  headers?: Record<string, string> | null
 }
 
 export interface ProvidersResponse {

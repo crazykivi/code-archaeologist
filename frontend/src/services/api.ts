@@ -1,4 +1,4 @@
-import type { Job, Report, ProvidersResponse, AnalyzeRequest } from '@/types'
+import type { Job, Report, ProvidersResponse, AnalyzeRequest, Provider, ProviderUpdateInput } from '@/types'
 
 const API_BASE = '/api/v1'
 
@@ -64,4 +64,60 @@ export async function deleteJobApi(id: string): Promise<void> {
     } catch { }
     throw new Error(message)
   }
+}
+
+export async function createProvider(name: string, payload: ProviderUpdateInput): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  return parseProviderResponse(response, 'Не удалось создать провайдера')
+}
+
+export async function updateProvider(name: string, payload: ProviderUpdateInput): Promise<Provider> {
+  const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  return parseProviderResponse(response, 'Не удалось сохранить настройки')
+}
+
+export async function deleteProvider(name: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(name)}`, {
+    method: 'DELETE'
+  })
+  if (!response.ok) {
+    let message = 'Не удалось удалить настройки'
+    try {
+      const error = await response.json()
+      if (error?.error) message = error.error
+    } catch { }
+    throw new Error(message)
+  }
+}
+
+export async function testProvider(
+  name: string
+): Promise<{ ok: boolean; reply?: string; error?: string }> {
+  const response = await fetch(`${API_BASE}/providers/${encodeURIComponent(name)}/test`, {
+    method: 'POST'
+  })
+  if (!response.ok) {
+    throw new Error('Не удалось выполнить проверку')
+  }
+  return response.json()
+}
+
+async function parseProviderResponse(response: Response, fallback: string): Promise<Provider> {
+  if (!response.ok) {
+    let message = fallback
+    try {
+      const error = await response.json()
+      if (error?.error) message = error.error
+    } catch { }
+    throw new Error(message)
+  }
+  return response.json()
 }
