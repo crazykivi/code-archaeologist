@@ -3,21 +3,25 @@ package store
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 type MemoryStore struct {
-	mu      sync.RWMutex
-	jobs    map[string]*Job
-	reports map[string]*Report
+	mu        sync.RWMutex
+	jobs      map[string]*Job
+	reports   map[string]*Report
+	providers map[string]ProviderConfig
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		jobs:    make(map[string]*Job),
-		reports: make(map[string]*Report),
+		jobs:      make(map[string]*Job),
+		reports:   make(map[string]*Report),
+		providers: make(map[string]ProviderConfig),
 	}
 }
 
@@ -177,4 +181,48 @@ func (s *MemoryStore) DeleteJob(id string) bool {
 	}
 	delete(s.jobs, id)
 	return true
+}
+
+func (s *MemoryStore) ListProviderConfigs() ([]ProviderConfig, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	all := make([]ProviderConfig, 0, len(s.providers))
+	for _, pc := range s.providers {
+		all = append(all, pc)
+	}
+	sort.Slice(all, func(i, k int) bool { return all[i].Name < all[k].Name })
+	return all, nil
+}
+
+func (s *MemoryStore) GetProviderConfig(name string) (*ProviderConfig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	pc, ok := s.providers[strings.TrimSpace(name)]
+	if !ok {
+		return nil, false
+	}
+	copy := pc
+	return &copy, true
+}
+
+func (s *MemoryStore) SaveProviderConfig(pc ProviderConfig) error {
+	pc.Name = strings.TrimSpace(pc.Name)
+	if pc.Name == "" {
+		return fmt.Errorf("provider name is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pc.UpdatedAt = time.Now().UTC()
+	s.providers[pc.Name] = pc
+	return nil
+}
+
+func (s *MemoryStore) DeleteProviderConfig(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.providers, strings.TrimSpace(name))
+	return nil
 }

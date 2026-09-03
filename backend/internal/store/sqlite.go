@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -68,6 +69,15 @@ func (s *SQLiteStore) migrate() error {
 		id TEXT PRIMARY KEY,
 		created_at DATETIME NOT NULL,
 		markdown TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS provider_configs (
+		name TEXT PRIMARY KEY,
+		base_url TEXT NOT NULL DEFAULT '',
+		api_key TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		headers_json TEXT NOT NULL DEFAULT '',
+		updated_at DATETIME NOT NULL
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -360,4 +370,112 @@ func (s *SQLiteStore) DeleteJob(id string) bool {
 	}
 	n, _ := res.RowsAffected()
 	return n > 0
+}
+
+func (s *SQLiteStore) ListProviderConfigs() ([]ProviderConfig, error) {
+	rows, err := s.db.Query(
+		`SELECT name, base_url, api_key, model, headers_json, updated_at FROM provider_configs ORDER BY name`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ProviderConfig
+	for rows.Next() {
+		pc, err := scanProviderConfig(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pc)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteStore) GetProviderConfig(name string) (*ProviderConfig, bool) {
+	var (
+		baseURL     string
+		apiKey      string
+		model       string
+		headersJSON sql.NullString
+		updatedAt   time.Time
+	)
+
+	err := s.db.QueryRow(
+		`SELECT base_url, api_key, model, headers_json, updated_at FROM provider_configs WHERE name = ?`,
+		strings.TrimSpace(name),
+	).Scan(&baseURL, &apiKey, &model, &headersJSON, &updatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, false
+		}
+		return nil, false
+	}
+
+	pc := ProviderConfig{
+		Name:      strings.TrimSpace(name),
+		BaseURL:   baseURL,
+		APIKey:    apiKey,
+		Model:     model,
+		UpdatedAt: updatedAt,
+	}
+	if headersJSON.Valid && headersJSON.String != "" {
+		_ = json.Unmarshal([]byte(headersJSON.String), &pc.Headers)
+	}
+	return &pc, true
+}
+
+func (s *SQLiteStore) SaveProviderConfig(pc ProviderConfig) error {
+	name := strings.TrimSpace(pc.Name)
+	if name == "" {
+		return fmt.Errorf("provider name is required")
+	}
+
+	headersJSON := ""
+	if len(pc.Headers) > 0 {
+		b, err := json.Marshal(pc.Headers)
+		if err != nil {
+			return fmt.Errorf("marshal headers: %w", err)
+		}
+		headersJSON = string(b)
+	}
+
+	_, err := s.db.Exec(
+		`INSERT INTO provider_configs (name, base_url, api_key, model, headers_json, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(name) DO UPDATE SET
+			base_url = excluded.base_url,
+			api_key = excluded.api_key,
+			model = excluded.model,
+			headers_json = excluded.headers_json,
+			updated_at = excluded.updated_at`,
+		name, strings.TrimSpace(pc.BaseURL), pc.APIKey, strings.TrimSpace(pc.Model), headersJSON, time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("upsert provider config: %w", err)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) DeleteProviderConfig(name string) error {
+	_, err := s.db.Exec(`DELETE FROM provider_configs WHERE name = ?`, strings.TrimSpace(name))
+	return err
+}
+
+func scanProviderConfig(scan func(dest ...any) error) (ProviderConfig, error) {
+	var (
+		pc          ProviderConfig
+		headersJSON sql.NullString
+		updatedAt   time.Time
+	)
+
+	err := scan(&pc.Name, &pc.BaseURL, &pc.APIKey, &pc.Model, &headersJSON, &updatedAt)
+	if err != nil {
+		return pc, err
+	}
+	pc.UpdatedAt = updatedAt
+	if headersJSON.Valid && headersJSON.String != "" {
+		_ = json.Unmarshal([]byte(headersJSON.String), &pc.Headers)
+	}
+	return pc, nil
 }

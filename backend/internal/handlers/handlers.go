@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"code-archaeologist/backend/internal/analyzer"
 	"code-archaeologist/backend/internal/config"
 	"code-archaeologist/backend/internal/llm"
+	"code-archaeologist/backend/internal/providers"
 	"code-archaeologist/backend/internal/scanner"
 	"code-archaeologist/backend/internal/store"
 )
@@ -21,18 +23,20 @@ import (
 var urlCredsRe = regexp.MustCompile(`(https?://)[^@/]+@`)
 
 type API struct {
-	cfg     *config.Config
-	store   store.Store
-	scanner *scanner.Service
-	jobSem  chan struct{}
+	cfg       *config.Config
+	store     store.Store
+	scanner   *scanner.Service
+	providers *providers.Manager
+	jobSem    chan struct{}
 }
 
 func New(cfg *config.Config, s store.Store) *API {
 	return &API{
-		cfg:     cfg,
-		store:   s,
-		scanner: scanner.NewService(cfg.Git),
-		jobSem:  make(chan struct{}, cfg.Analysis.MaxConcurrentJobs),
+		cfg:       cfg,
+		store:     s,
+		scanner:   scanner.NewService(cfg.Git),
+		providers: providers.NewManager(cfg, s),
+		jobSem:    make(chan struct{}, cfg.Analysis.MaxConcurrentJobs),
 	}
 }
 
@@ -77,7 +81,7 @@ func (a *API) Analyze(c *gin.Context) {
 	if provider == "" {
 		provider = a.cfg.DefaultProvider
 	}
-	if !llm.IsSupported(provider) {
+	if !a.providers.Knows(provider) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported provider"})
 		return
 	}
@@ -193,24 +197,93 @@ func (a *API) Report(c *gin.Context) {
 }
 
 func (a *API) Providers(c *gin.Context) {
-	type providerStatus struct {
-		Name       string `json:"name"`
-		Configured bool   `json:"configured"`
-	}
-
-	list := []providerStatus{
-		{Name: "ollama", Configured: a.cfg.Ollama.BaseURL != ""},
-		{Name: "llamacpp", Configured: a.cfg.LlamaCpp.BaseURL != ""},
-		{Name: "openai", Configured: a.cfg.OpenAI.BaseURL != "" && a.cfg.OpenAI.APIKey != ""},
-		{Name: "deepseek", Configured: a.cfg.DeepSeek.BaseURL != "" && a.cfg.DeepSeek.APIKey != ""},
-		{Name: "qwen", Configured: a.cfg.Qwen.BaseURL != "" && a.cfg.Qwen.APIKey != ""},
-		{Name: "custom", Configured: a.cfg.Custom.BaseURL != ""},
+	list, err := a.providers.List()
+	if err != nil {
+		log.Printf("[Handlers] failed to list providers: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list providers"})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"default":   a.cfg.DefaultProvider,
 		"providers": list,
 	})
+}
+
+func (a *API) CreateProvider(c *gin.Context) {
+	var in providers.UpdateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(c.Param("name"))
+	info, err := a.providers.Create(name, in)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, info)
+}
+
+func (a *API) UpdateProvider(c *gin.Context) {
+	var in providers.UpdateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(c.Param("name"))
+	info, err := a.providers.Update(name, in)
+	if err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
+func (a *API) DeleteProvider(c *gin.Context) {
+	name := strings.TrimSpace(c.Param("name"))
+	if err := a.providers.Delete(name); err != nil {
+		respondProviderError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (a *API) TestProvider(c *gin.Context) {
+	name := strings.TrimSpace(c.Param("name"))
+
+	reply, err := a.providers.Test(c.Request.Context(), name)
+	if err != nil {
+		msg := sanitizeError(err)
+		if sc, rErr := a.providers.Resolve(name); rErr == nil && sc.APIKey != "" {
+			msg = strings.ReplaceAll(msg, sc.APIKey, "***")
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": false, "error": truncateForUI(msg, 400)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"ok": true, "reply": truncateForUI(reply, 200)})
+}
+
+func truncateForUI(s string, limit int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= limit {
+		return string(r)
+	}
+	return string(r[:limit]) + "…"
+}
+
+func respondProviderError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, providers.ErrNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+	case errors.Is(err, providers.ErrConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	}
 }
 
 func (a *API) runJob(id string, req store.Request, rawSource string) {
@@ -224,7 +297,7 @@ func (a *API) runJob(id string, req store.Request, rawSource string) {
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.Analysis.JobTimeout)
 	defer cancel()
 
-	provider, err := llm.NewProvider(req.Provider, a.cfg)
+	provider, err := a.providers.Build(req.Provider)
 	if err != nil {
 		a.failJob(id, "provider configuration failed", err)
 		return

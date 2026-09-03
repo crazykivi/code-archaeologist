@@ -12,11 +12,24 @@ import (
 	"time"
 )
 
+// APITokenPlaceholder в значении кастомного заголовка заменяется на реальный API-ключ.
+const APITokenPlaceholder = "{{api_key}}"
+
+// StaticConfig — полный набор параметров провайдера после разрешения дефолтов/env/настроек из БД.
+type StaticConfig struct {
+	Name    string
+	BaseURL string
+	APIKey  string
+	Model   string
+	Headers map[string]string
+}
+
 type openAIProvider struct {
 	name         string
 	endpoint     string
 	apiKey       string
 	defaultModel string
+	headers      map[string]string
 	client       *http.Client
 }
 
@@ -39,21 +52,22 @@ type openAIResponse struct {
 	} `json:"choices"`
 }
 
-func NewOpenAICompatible(name, baseURL, apiKey, model string, timeout time.Duration) (*openAIProvider, error) {
-	endpoint := buildOpenAIEndpoint(baseURL)
+func NewOpenAICompatible(cfg StaticConfig, timeout time.Duration) (*openAIProvider, error) {
+	endpoint := buildOpenAIEndpoint(cfg.BaseURL)
 	if endpoint == "" {
-		return nil, fmt.Errorf("%s base URL is empty", name)
+		return nil, fmt.Errorf("%s base URL is empty", cfg.Name)
 	}
 
 	if _, err := url.ParseRequestURI(endpoint); err != nil {
-		return nil, fmt.Errorf("%s base URL is invalid: %w", name, err)
+		return nil, fmt.Errorf("%s base URL is invalid: %w", cfg.Name, err)
 	}
 
 	return &openAIProvider{
-		name:         name,
+		name:         cfg.Name,
 		endpoint:     endpoint,
-		apiKey:       apiKey,
-		defaultModel: model,
+		apiKey:       cfg.APIKey,
+		defaultModel: cfg.Model,
+		headers:      cfg.Headers,
 		client:       newHTTPClient(timeout),
 	}, nil
 }
@@ -102,9 +116,7 @@ func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts Chat
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
+	applyHeaders(req, p.headers, p.apiKey)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -127,6 +139,21 @@ func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts Chat
 	}
 
 	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+}
+
+// applyHeaders применяет кастомные заголовки с подстановкой ключа,
+// а при их отсутствии — стандартный Authorization: Bearer.
+func applyHeaders(req *http.Request, headers map[string]string, apiKey string) {
+	hasAuth := false
+	for k, v := range headers {
+		if strings.EqualFold(k, "Authorization") {
+			hasAuth = true
+		}
+		req.Header.Set(k, strings.ReplaceAll(v, APITokenPlaceholder, apiKey))
+	}
+	if !hasAuth && apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 }
 
 func buildOpenAIEndpoint(baseURL string) string {

@@ -41,53 +41,75 @@ func NormalizeProvider(name string) string {
 	}
 }
 
-func IsSupported(name string) bool {
-	switch NormalizeProvider(name) {
-	case "ollama", "openai", "deepseek", "qwen", "llamacpp", "custom":
-		return true
-	default:
-		return false
-	}
+// BuiltinProviders — встроенные имена провайдеров (настраиваются через env, переопределяются из БД).
+func BuiltinProviders() []string {
+	return []string{"ollama", "llamacpp", "openai", "deepseek", "qwen", "custom"}
 }
 
+func IsBuiltin(name string) bool {
+	name = NormalizeProvider(name)
+	for _, b := range BuiltinProviders() {
+		if name == b {
+			return true
+		}
+	}
+	return false
+}
+
+// NewFromStatic собирает провайдера из уже разрешённой конфигурации.
+// Все провайдеры, включая Ollama, используют OpenAI-совместимый chat completions API.
+func NewFromStatic(cfg StaticConfig, timeout time.Duration) (Provider, error) {
+	cfg.Name = NormalizeProvider(cfg.Name)
+	return NewOpenAICompatible(cfg, timeout)
+}
+
+// NewProvider — сборка провайдера только из env-конфигурации (без настроек из БД).
 func NewProvider(name string, cfg *config.Config) (Provider, error) {
 	name = NormalizeProvider(name)
 	timeout := cfg.Analysis.RequestTimeout
 
+	static := StaticConfig{Name: name}
 	switch name {
 	case "ollama":
-		return NewOllama(cfg.Ollama.BaseURL, cfg.Ollama.Model, timeout)
-
+		static.BaseURL = cfg.Ollama.BaseURL
+		static.Model = cfg.Ollama.Model
 	case "llamacpp":
-		return NewOpenAICompatible("llamacpp", cfg.LlamaCpp.BaseURL, cfg.LlamaCpp.APIKey, cfg.LlamaCpp.Model, timeout)
-
+		static.BaseURL = cfg.LlamaCpp.BaseURL
+		static.APIKey = cfg.LlamaCpp.APIKey
+		static.Model = cfg.LlamaCpp.Model
 	case "openai":
 		if cfg.OpenAI.APIKey == "" {
 			return nil, fmt.Errorf("OPENAI_API_KEY is required")
 		}
-		return NewOpenAICompatible("openai", cfg.OpenAI.BaseURL, cfg.OpenAI.APIKey, cfg.OpenAI.Model, timeout)
-
+		static.BaseURL = cfg.OpenAI.BaseURL
+		static.APIKey = cfg.OpenAI.APIKey
+		static.Model = cfg.OpenAI.Model
 	case "deepseek":
 		if cfg.DeepSeek.APIKey == "" {
 			return nil, fmt.Errorf("DEEPSEEK_API_KEY is required")
 		}
-		return NewOpenAICompatible("deepseek", cfg.DeepSeek.BaseURL, cfg.DeepSeek.APIKey, cfg.DeepSeek.Model, timeout)
-
+		static.BaseURL = cfg.DeepSeek.BaseURL
+		static.APIKey = cfg.DeepSeek.APIKey
+		static.Model = cfg.DeepSeek.Model
 	case "qwen":
 		if cfg.Qwen.APIKey == "" {
 			return nil, fmt.Errorf("DASHSCOPE_API_KEY is required")
 		}
-		return NewOpenAICompatible("qwen", cfg.Qwen.BaseURL, cfg.Qwen.APIKey, cfg.Qwen.Model, timeout)
-
+		static.BaseURL = cfg.Qwen.BaseURL
+		static.APIKey = cfg.Qwen.APIKey
+		static.Model = cfg.Qwen.Model
 	case "custom":
 		if cfg.Custom.BaseURL == "" {
 			return nil, fmt.Errorf("CUSTOM_LLM_BASE_URL is required")
 		}
-		return NewOpenAICompatible("custom", cfg.Custom.BaseURL, cfg.Custom.APIKey, cfg.Custom.Model, timeout)
-
+		static.BaseURL = cfg.Custom.BaseURL
+		static.APIKey = cfg.Custom.APIKey
+		static.Model = cfg.Custom.Model
 	default:
 		return nil, fmt.Errorf("unsupported provider %q", name)
 	}
+
+	return NewFromStatic(static, timeout)
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {

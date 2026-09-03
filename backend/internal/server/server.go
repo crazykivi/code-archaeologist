@@ -51,6 +51,10 @@ func New(cfg *config.Config, api *handlers.API) *gin.Engine {
 	v1.DELETE("/jobs/:id", middleware.RateLimit(readLimiter), api.DeleteJob)
 	v1.GET("/reports/:id", middleware.RateLimit(readLimiter), api.Report)
 	v1.GET("/providers", middleware.RateLimit(readLimiter), api.Providers)
+	v1.POST("/providers/:name", middleware.RateLimit(analyzeLimiter), api.CreateProvider)
+	v1.PUT("/providers/:name", middleware.RateLimit(analyzeLimiter), api.UpdateProvider)
+	v1.DELETE("/providers/:name", middleware.RateLimit(analyzeLimiter), api.DeleteProvider)
+	v1.POST("/providers/:name/test", middleware.RateLimit(analyzeLimiter), api.TestProvider)
 
 	r.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})

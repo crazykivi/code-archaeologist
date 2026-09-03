@@ -60,6 +60,17 @@ type Report struct {
 	Markdown  string    `json:"markdown"`
 }
 
+// ProviderConfig — снимок настроек провайдера, сохранённый пользователем.
+// Пустые значения означают «не задано».
+type ProviderConfig struct {
+	Name      string            `json:"name"`
+	BaseURL   string            `json:"base_url,omitempty"`
+	APIKey    string            `json:"api_key,omitempty"`
+	Model     string            `json:"model,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	UpdatedAt time.Time         `json:"updated_at"`
+}
+
 type Store interface {
 	// Jobs
 	CreateJob(req Request) (*Job, error)
@@ -74,6 +85,12 @@ type Store interface {
 	// Reports
 	SaveReport(markdown string) (*Report, error)
 	GetReport(id string) (*Report, bool)
+
+	// Provider settings
+	ListProviderConfigs() ([]ProviderConfig, error)
+	GetProviderConfig(name string) (*ProviderConfig, bool)
+	SaveProviderConfig(pc ProviderConfig) error
+	DeleteProviderConfig(name string) error
 
 	// Lifecycle
 	Close() error
