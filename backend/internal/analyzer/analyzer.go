@@ -711,7 +711,7 @@ type promptSet struct {
 
 var reportPrompts = map[string]promptSet{
 	ReportDecisions: {
-		system: baseFactsPrompt,
+		system:      baseFactsPrompt,
 		instruction: "Собери технические решения, которые можно обоснованно извлечь из этих коммитов",
 	},
 	ReportArchitecture: {
