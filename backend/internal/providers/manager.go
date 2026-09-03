@@ -133,10 +133,11 @@ func (m *Manager) Test(ctx context.Context, name string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	return p.Chat(ctx, []llm.Message{{Role: "user", Content: "Reply with a single word: ok"}}, llm.ChatOptions{
+	resp, err := p.Chat(ctx, []llm.Message{{Role: "user", Content: "Reply with a single word: ok"}}, llm.ChatOptions{
 		Temperature: 0,
 		MaxTokens:   10,
 	})
+	return resp.Content, err
 }
 
 // List возвращает провайдеров для UI: встроенные + пользовательские, без секретов.

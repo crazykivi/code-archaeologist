@@ -50,6 +50,13 @@ type openAIResponse struct {
 	Choices []struct {
 		Message openAIMessage `json:"message"`
 	} `json:"choices"`
+	Usage usage `json:"usage"`
+}
+
+type usage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
 }
 
 func NewOpenAICompatible(cfg StaticConfig, timeout time.Duration) (*openAIProvider, error) {
@@ -80,13 +87,13 @@ func (p *openAIProvider) DefaultModel() string {
 	return p.defaultModel
 }
 
-func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts ChatOptions) (string, error) {
+func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts ChatOptions) (Response, error) {
 	model := opts.Model
 	if model == "" {
 		model = p.defaultModel
 	}
 	if model == "" {
-		return "", fmt.Errorf("%s model is required", p.name)
+		return Response{}, fmt.Errorf("%s model is required", p.name)
 	}
 
 	reqMessages := make([]openAIMessage, 0, len(messages))
@@ -107,12 +114,12 @@ func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts Chat
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("%s failed to encode request: %w", p.name, err)
+		return Response{}, fmt.Errorf("%s failed to encode request: %w", p.name, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("%s failed to create request: %w", p.name, err)
+		return Response{}, fmt.Errorf("%s failed to create request: %w", p.name, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -120,25 +127,36 @@ func (p *openAIProvider) Chat(ctx context.Context, messages []Message, opts Chat
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%s request failed: %w", p.name, err)
+		return Response{}, fmt.Errorf("%s request failed: %w", p.name, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", fmt.Errorf("%s provider returned HTTP %d: %s", p.name, resp.StatusCode, truncateString(string(errBody), 512))
+		return Response{}, &HTTPError{
+			Provider: p.name,
+			Status:   resp.StatusCode,
+			Body:     string(errBody),
+		}
 	}
 
 	var out openAIResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
-		return "", fmt.Errorf("%s invalid response: %w", p.name, err)
+		return Response{}, fmt.Errorf("%s invalid response: %w", p.name, err)
 	}
 
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("%s returned no choices", p.name)
+		return Response{}, fmt.Errorf("%s returned no choices", p.name)
 	}
 
-	return strings.TrimSpace(out.Choices[0].Message.Content), nil
+	return Response{
+		Content: strings.TrimSpace(out.Choices[0].Message.Content),
+		Usage: Usage{
+			PromptTokens:     out.Usage.PromptTokens,
+			CompletionTokens: out.Usage.CompletionTokens,
+			TotalTokens:      out.Usage.TotalTokens,
+		},
+	}, nil
 }
 
 // applyHeaders применяет кастомные заголовки с подстановкой ключа,
